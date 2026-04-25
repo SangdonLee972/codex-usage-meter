@@ -14,6 +14,7 @@ Codex Usage Meter reads the local Codex session logs already stored on your Mac 
 - A visual gauge for the 5-hour Codex usage window
 - A visual gauge for the weekly Codex usage window
 - Percentage labels beside each gauge
+- Last-change estimate based on the previous distinct Codex usage snapshot
 - Reset times for both windows
 - A shortcut to the official Codex usage dashboard
 - A small CLI status output with local token stats
@@ -62,7 +63,7 @@ Print the latest local snapshot:
 Example:
 
 ```text
-Cdx 92% left | weekly 58% left | 5h reset 2026-04-25 20:50 GMT+9 | weekly reset 2026-04-29 03:20 GMT+9 | local today 25.2M
+Cdx 92% left | weekly 58% left | last change 5h -1% left, weekly -1% left | 5h reset 2026-04-25 20:50 GMT+9 | weekly reset 2026-04-29 03:20 GMT+9 | local today 25.2M
 ```
 
 ## How It Works
@@ -70,6 +71,8 @@ Cdx 92% left | weekly 58% left | 5h reset 2026-04-25 20:50 GMT+9 | weekly reset 
 Codex stores session JSONL files locally. Some events include a `rate_limits` object with the current Codex usage snapshot. Codex Usage Meter scans the newest session files, finds the latest snapshot, and renders it as a menu bar meter.
 
 It does not read your prompts for display, upload your data, or call any remote API. It only reads local Codex files on your machine.
+
+The "last change" line compares the newest rate-limit snapshot with the previous distinct snapshot. It is a practical estimate of how much the visible usage meter moved after recent Codex activity, not an official per-message bill.
 
 ## Limitations
 

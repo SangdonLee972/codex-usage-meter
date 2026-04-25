@@ -12,6 +12,26 @@ struct RateLimitSnapshot {
     let reachedType: String?
 }
 
+struct UsageSnapshotHistory {
+    let latest: RateLimitSnapshot
+    let previousDistinct: RateLimitSnapshot?
+
+    var primaryLeftDelta: Double? {
+        leftDelta(latestUsed: latest.primaryUsedPercent, previousUsed: previousDistinct?.primaryUsedPercent)
+    }
+
+    var secondaryLeftDelta: Double? {
+        leftDelta(latestUsed: latest.secondaryUsedPercent, previousUsed: previousDistinct?.secondaryUsedPercent)
+    }
+
+    private func leftDelta(latestUsed: Double, previousUsed: Double?) -> Double? {
+        guard let previousUsed else {
+            return nil
+        }
+        return (100 - latestUsed) - (100 - previousUsed)
+    }
+}
+
 struct LocalTokenStats {
     let lastFiveHours: Int64?
     let today: Int64?
@@ -27,6 +47,10 @@ final class UsageReader {
     }
 
     func latestSnapshot() -> RateLimitSnapshot? {
+        latestSnapshotHistory()?.latest
+    }
+
+    func latestSnapshotHistory() -> UsageSnapshotHistory? {
         let sessionsRoot = home.appendingPathComponent(".codex/sessions")
         guard let enumerator = FileManager.default.enumerator(
             at: sessionsRoot,
@@ -42,16 +66,22 @@ final class UsageReader {
             candidates.append((url, values?.contentModificationDate ?? .distantPast))
         }
 
-        var best: RateLimitSnapshot?
+        var snapshots: [RateLimitSnapshot] = []
         for candidate in candidates.sorted(by: { $0.modifiedAt > $1.modifiedAt }).prefix(30) {
-            guard let snapshot = snapshotFromTail(of: candidate.url) else {
-                continue
-            }
-            if best == nil || snapshot.observedAt > best!.observedAt {
-                best = snapshot
-            }
+            snapshots.append(contentsOf: snapshotsFromTail(of: candidate.url, maxSnapshots: 80))
         }
-        return best
+
+        let sorted = snapshots.sorted { $0.observedAt > $1.observedAt }
+        guard let latest = sorted.first else {
+            return nil
+        }
+
+        let previousDistinct = sorted.dropFirst().first { previous in
+            abs(previous.primaryUsedPercent - latest.primaryUsedPercent) >= 0.01 ||
+                abs(previous.secondaryUsedPercent - latest.secondaryUsedPercent) >= 0.01
+        }
+
+        return UsageSnapshotHistory(latest: latest, previousDistinct: previousDistinct)
     }
 
     func localTokenStats() -> LocalTokenStats {
@@ -76,9 +106,9 @@ final class UsageReader {
         )
     }
 
-    private func snapshotFromTail(of url: URL) -> RateLimitSnapshot? {
+    private func snapshotsFromTail(of url: URL, maxSnapshots: Int) -> [RateLimitSnapshot] {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
+            return []
         }
         defer { try? handle.close() }
 
@@ -88,9 +118,10 @@ final class UsageReader {
         try? handle.seek(toOffset: offset)
         let data = handle.readDataToEndOfFile()
         guard let text = String(data: data, encoding: .utf8) else {
-            return nil
+            return []
         }
 
+        var snapshots: [RateLimitSnapshot] = []
         for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
             guard let lineData = String(line).data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
@@ -101,7 +132,7 @@ final class UsageReader {
                 continue
             }
 
-            return RateLimitSnapshot(
+            snapshots.append(RateLimitSnapshot(
                 observedAt: parseDate(object["timestamp"] as? String) ?? Date.distantPast,
                 planType: rateLimits["plan_type"] as? String ?? "unknown",
                 primaryUsedPercent: number(primary["used_percent"]),
@@ -110,10 +141,14 @@ final class UsageReader {
                 secondaryResetsAt: epochDate(secondary["resets_at"]),
                 credits: stringify(rateLimits["credits"]),
                 reachedType: rateLimits["rate_limit_reached_type"] as? String
-            )
+            ))
+
+            if snapshots.count >= maxSnapshots {
+                break
+            }
         }
 
-        return nil
+        return snapshots
     }
 
     private func parseDate(_ value: String?) -> Date? {
@@ -288,7 +323,7 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
         return formatter
     }()
     private var timer: Timer?
-    private var lastSnapshot: RateLimitSnapshot?
+    private var lastHistory: UsageSnapshotHistory?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -301,13 +336,13 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
-        lastSnapshot = reader.latestSnapshot()
+        lastHistory = reader.latestSnapshotHistory()
         updateStatusTitle()
         rebuildMenu()
     }
 
     private func updateStatusTitle() {
-        guard let snapshot = lastSnapshot else {
+        guard let snapshot = lastHistory?.latest else {
             statusItem.button?.title = "Cdx ?"
             statusItem.button?.toolTip = "No Codex usage snapshot found"
             return
@@ -327,7 +362,8 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
         menu.addItem(disabled("Codex Usage Meter"))
         menu.addItem(NSMenuItem.separator())
 
-        if let snapshot = lastSnapshot {
+        if let history = lastHistory {
+            let snapshot = history.latest
             let primaryRemaining = max(0, 100 - snapshot.primaryUsedPercent)
             let secondaryRemaining = max(0, 100 - snapshot.secondaryUsedPercent)
 
@@ -342,6 +378,7 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
                 remainingPercent: secondaryRemaining
             ))
             menu.addItem(NSMenuItem.separator())
+            menu.addItem(disabled("Last change: \(formatDelta(history.primaryLeftDelta, label: "5h")), \(formatDelta(history.secondaryLeftDelta, label: "weekly"))"))
             menu.addItem(disabled("Plan: \(snapshot.planType)"))
             if snapshot.credits != nil {
                 menu.addItem(disabled("Credits data available"))
@@ -400,6 +437,25 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
         }
         return formatter.string(from: date)
     }
+
+    private func formatDelta(_ delta: Double?, label: String) -> String {
+        guard let delta else {
+            return "\(label) unknown"
+        }
+        if abs(delta) < 0.01 {
+            return "\(label) no change"
+        }
+
+        let sign = delta > 0 ? "+" : ""
+        return "\(label) \(sign)\(formatPercent(delta)) left"
+    }
+
+    private func formatPercent(_ value: Double) -> String {
+        if value.rounded() == value {
+            return "\(Int(value))%"
+        }
+        return String(format: "%.1f%%", value)
+    }
 }
 
 @main
@@ -421,11 +477,12 @@ struct Main {
 
     private static func printStatus() {
         let reader = UsageReader()
-        guard let snapshot = reader.latestSnapshot() else {
+        guard let history = reader.latestSnapshotHistory() else {
             print("Cdx ?: no Codex rate-limit snapshot found")
             return
         }
 
+        let snapshot = history.latest
         let stats = reader.localTokenStats()
         let primaryLeft = max(0, 100 - snapshot.primaryUsedPercent)
         let weeklyLeft = max(0, 100 - snapshot.secondaryUsedPercent)
@@ -437,8 +494,23 @@ struct Main {
         let primaryReset = snapshot.primaryResetsAt.map { resetFormatter.string(from: $0) } ?? "unknown"
         let weeklyReset = snapshot.secondaryResetsAt.map { resetFormatter.string(from: $0) } ?? "unknown"
         let todayTokens = stats.today.map(formatTokenCountForConsole) ?? "unknown"
+        let primaryDelta = formatDeltaForConsole(history.primaryLeftDelta, label: "5h")
+        let weeklyDelta = formatDeltaForConsole(history.secondaryLeftDelta, label: "weekly")
 
-        print("Cdx \(Int(primaryLeft.rounded()))% left | weekly \(Int(weeklyLeft.rounded()))% left | 5h reset \(primaryReset) | weekly reset \(weeklyReset) | local today \(todayTokens)")
+        print("Cdx \(Int(primaryLeft.rounded()))% left | weekly \(Int(weeklyLeft.rounded()))% left | last change \(primaryDelta), \(weeklyDelta) | 5h reset \(primaryReset) | weekly reset \(weeklyReset) | local today \(todayTokens)")
+    }
+
+    private static func formatDeltaForConsole(_ delta: Double?, label: String) -> String {
+        guard let delta else {
+            return "\(label) unknown"
+        }
+        if abs(delta) < 0.01 {
+            return "\(label) no change"
+        }
+
+        let sign = delta > 0 ? "+" : ""
+        let value = delta.rounded() == delta ? "\(Int(delta))%" : String(format: "%.1f%%", delta)
+        return "\(label) \(sign)\(value) left"
     }
 
     private static func formatTokenCountForConsole(_ value: Int64) -> String {
