@@ -55,7 +55,7 @@ The installer builds the app, installs the binary to `~/.local/bin/codex-usage-m
 Print the latest local snapshot:
 
 ```bash
-codex-usage-meter --print
+~/.local/bin/codex-usage-meter --print
 ```
 
 Example:
