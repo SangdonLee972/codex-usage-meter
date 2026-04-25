@@ -189,6 +189,7 @@ final class GaugeMenuView: NSView {
     private let subtitle: String
     private let fraction: CGFloat
     private let state: String
+    private let percentage: String
     private let fillColor: NSColor
 
     override var isFlipped: Bool {
@@ -200,8 +201,9 @@ final class GaugeMenuView: NSView {
         self.subtitle = subtitle
         self.fraction = CGFloat(min(100, max(0, remainingPercent)) / 100)
         self.state = GaugeMenuView.stateLabel(for: remainingPercent)
+        self.percentage = "\(Int(remainingPercent.rounded()))% left"
         self.fillColor = GaugeMenuView.color(for: remainingPercent)
-        super.init(frame: NSRect(x: 0, y: 0, width: 286, height: 58))
+        super.init(frame: NSRect(x: 0, y: 0, width: 314, height: 58))
     }
 
     required init?(coder: NSCoder) {
@@ -219,15 +221,20 @@ final class GaugeMenuView: NSView {
             .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
             .foregroundColor: fillColor
         ]
+        let percentageAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
         let subtitleAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
             .foregroundColor: NSColor.secondaryLabelColor
         ]
 
-        title.draw(in: NSRect(x: 14, y: 7, width: 150, height: 18), withAttributes: titleAttributes)
-        state.draw(in: NSRect(x: 178, y: 8, width: 94, height: 16), withAttributes: stateAttributes)
+        title.draw(in: NSRect(x: 14, y: 7, width: 135, height: 18), withAttributes: titleAttributes)
+        percentage.draw(in: NSRect(x: 159, y: 8, width: 70, height: 16), withAttributes: percentageAttributes)
+        state.draw(in: NSRect(x: 232, y: 8, width: 68, height: 16), withAttributes: stateAttributes)
 
-        let track = NSRect(x: 14, y: 29, width: 258, height: 10)
+        let track = NSRect(x: 14, y: 29, width: 286, height: 10)
         NSColor.quaternaryLabelColor.withAlphaComponent(0.28).setFill()
         NSBezierPath(roundedRect: track, xRadius: 5, yRadius: 5).fill()
 
@@ -238,7 +245,7 @@ final class GaugeMenuView: NSView {
             NSBezierPath(roundedRect: fill, xRadius: 5, yRadius: 5).fill()
         }
 
-        subtitle.draw(in: NSRect(x: 14, y: 42, width: 258, height: 14), withAttributes: subtitleAttributes)
+        subtitle.draw(in: NSRect(x: 14, y: 42, width: 286, height: 14), withAttributes: subtitleAttributes)
     }
 
     private static func stateLabel(for remainingPercent: Double) -> String {

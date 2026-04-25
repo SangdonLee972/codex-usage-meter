@@ -13,6 +13,7 @@ Codex Usage Meter reads the local Codex session logs already stored on your Mac 
 - A compact menu bar label like `Cdx 92%`
 - A visual gauge for the 5-hour Codex usage window
 - A visual gauge for the weekly Codex usage window
+- Percentage labels beside each gauge
 - Reset times for both windows
 - A shortcut to the official Codex usage dashboard
 - A small CLI status output with local token stats
