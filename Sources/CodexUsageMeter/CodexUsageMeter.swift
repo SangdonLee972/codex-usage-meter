@@ -32,6 +32,66 @@ struct UsageSnapshotHistory {
     }
 }
 
+struct TokenUsage {
+    let inputTokens: Int64
+    let cachedInputTokens: Int64
+    let outputTokens: Int64
+    let reasoningOutputTokens: Int64
+    let totalTokens: Int64
+
+    static let zero = TokenUsage(inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0)
+
+    func adding(_ other: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            inputTokens: inputTokens + other.inputTokens,
+            cachedInputTokens: cachedInputTokens + other.cachedInputTokens,
+            outputTokens: outputTokens + other.outputTokens,
+            reasoningOutputTokens: reasoningOutputTokens + other.reasoningOutputTokens,
+            totalTokens: totalTokens + other.totalTokens
+        )
+    }
+
+    func delta(from previous: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            inputTokens: max(0, inputTokens - previous.inputTokens),
+            cachedInputTokens: max(0, cachedInputTokens - previous.cachedInputTokens),
+            outputTokens: max(0, outputTokens - previous.outputTokens),
+            reasoningOutputTokens: max(0, reasoningOutputTokens - previous.reasoningOutputTokens),
+            totalTokens: max(0, totalTokens - previous.totalTokens)
+        )
+    }
+}
+
+struct TokenUsageEvent {
+    let source: String
+    let observedAt: Date
+    let sequence: Int
+    let totalUsage: TokenUsage
+    let lastUsage: TokenUsage
+}
+
+struct TokenSessionScan {
+    let source: String
+    let taskStarts: [Date]
+    let tokenEvents: [TokenUsageEvent]
+}
+
+struct TokenActivitySummary {
+    let latestCallUsage: TokenUsage?
+    let latestTurnUsage: TokenUsage?
+    let recentUsage: TokenUsage
+    let recentWindowSeconds: TimeInterval
+
+    static func empty(recentWindowSeconds: TimeInterval) -> TokenActivitySummary {
+        TokenActivitySummary(
+            latestCallUsage: nil,
+            latestTurnUsage: nil,
+            recentUsage: .zero,
+            recentWindowSeconds: recentWindowSeconds
+        )
+    }
+}
+
 struct LocalTokenStats {
     let lastFiveHours: Int64?
     let today: Int64?
@@ -106,6 +166,42 @@ final class UsageReader {
         )
     }
 
+    func tokenActivitySummary(recentWindowSeconds: TimeInterval = 180) -> TokenActivitySummary {
+        let sessions = tokenSessionScans()
+        guard !sessions.isEmpty else {
+            return .empty(recentWindowSeconds: recentWindowSeconds)
+        }
+
+        let allEvents = sessions.flatMap(\.tokenEvents)
+        let latestEvent = allEvents.max { lhs, rhs in
+            if lhs.observedAt == rhs.observedAt {
+                return lhs.sequence < rhs.sequence
+            }
+            return lhs.observedAt < rhs.observedAt
+        }
+
+        let latestTask = sessions.flatMap { session in
+            session.taskStarts.map { (source: session.source, startedAt: $0) }
+        }.max { lhs, rhs in
+            lhs.startedAt < rhs.startedAt
+        }
+
+        let latestTurnUsage: TokenUsage?
+        if let latestTask,
+           let session = sessions.first(where: { $0.source == latestTask.source }) {
+            latestTurnUsage = turnUsage(in: session, startedAt: latestTask.startedAt)
+        } else {
+            latestTurnUsage = nil
+        }
+
+        return TokenActivitySummary(
+            latestCallUsage: latestEvent?.lastUsage,
+            latestTurnUsage: latestTurnUsage,
+            recentUsage: recentUsage(in: sessions, recentWindowSeconds: recentWindowSeconds),
+            recentWindowSeconds: recentWindowSeconds
+        )
+    }
+
     private func snapshotsFromTail(of url: URL, maxSnapshots: Int) -> [RateLimitSnapshot] {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             return []
@@ -151,6 +247,141 @@ final class UsageReader {
         return snapshots
     }
 
+    private func tokenSessionScans() -> [TokenSessionScan] {
+        let sessionsRoot = home.appendingPathComponent(".codex/sessions")
+        guard let enumerator = FileManager.default.enumerator(
+            at: sessionsRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var candidates: [(url: URL, modifiedAt: Date)] = []
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            candidates.append((url, values?.contentModificationDate ?? .distantPast))
+        }
+
+        return candidates
+            .sorted(by: { $0.modifiedAt > $1.modifiedAt })
+            .prefix(12)
+            .compactMap { scanTokenSessionTail(of: $0.url) }
+    }
+
+    private func scanTokenSessionTail(of url: URL) -> TokenSessionScan? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+
+        let maxBytes: UInt64 = 2 * 1024 * 1024
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        let offset = fileSize > maxBytes ? fileSize - maxBytes : 0
+        try? handle.seek(toOffset: offset)
+        let data = handle.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        var sequence = 0
+        var taskStarts: [Date] = []
+        var tokenEvents: [TokenUsageEvent] = []
+
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            sequence += 1
+            guard let lineData = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let timestamp = parseDate(object["timestamp"] as? String),
+                  let payload = object["payload"] as? [String: Any],
+                  let payloadType = payload["type"] as? String else {
+                continue
+            }
+
+            if payloadType == "task_started" {
+                taskStarts.append(timestamp)
+                continue
+            }
+
+            guard payloadType == "token_count",
+                  let info = payload["info"] as? [String: Any],
+                  let total = info["total_token_usage"] as? [String: Any],
+                  let last = info["last_token_usage"] as? [String: Any] else {
+                continue
+            }
+
+            tokenEvents.append(TokenUsageEvent(
+                source: url.path,
+                observedAt: timestamp,
+                sequence: sequence,
+                totalUsage: tokenUsage(total),
+                lastUsage: tokenUsage(last)
+            ))
+        }
+
+        guard !taskStarts.isEmpty || !tokenEvents.isEmpty else {
+            return nil
+        }
+
+        return TokenSessionScan(source: url.path, taskStarts: taskStarts, tokenEvents: tokenEvents)
+    }
+
+    private func turnUsage(in session: TokenSessionScan, startedAt: Date) -> TokenUsage? {
+        let events = session.tokenEvents.sorted {
+            if $0.observedAt == $1.observedAt {
+                return $0.sequence < $1.sequence
+            }
+            return $0.observedAt < $1.observedAt
+        }
+
+        guard let latestAfterStart = events.last(where: { $0.observedAt >= startedAt }) else {
+            return nil
+        }
+
+        if let previousBeforeStart = events.last(where: { $0.observedAt < startedAt }) {
+            return latestAfterStart.totalUsage.delta(from: previousBeforeStart.totalUsage)
+        }
+
+        if let firstAfterStart = events.first(where: { $0.observedAt >= startedAt }),
+           firstAfterStart.sequence != latestAfterStart.sequence {
+            return latestAfterStart.totalUsage.delta(from: firstAfterStart.totalUsage)
+        }
+
+        return latestAfterStart.lastUsage
+    }
+
+    private func recentUsage(in sessions: [TokenSessionScan], recentWindowSeconds: TimeInterval) -> TokenUsage {
+        let cutoff = Date().addingTimeInterval(-recentWindowSeconds)
+        var total = TokenUsage.zero
+
+        for session in sessions {
+            let events = session.tokenEvents.sorted {
+                if $0.observedAt == $1.observedAt {
+                    return $0.sequence < $1.sequence
+                }
+                return $0.observedAt < $1.observedAt
+            }
+            var previous: TokenUsage?
+
+            for event in events {
+                defer { previous = event.totalUsage }
+
+                guard event.observedAt >= cutoff,
+                      let previous else {
+                    continue
+                }
+
+                let delta = event.totalUsage.delta(from: previous)
+                guard delta.totalTokens > 0 else {
+                    continue
+                }
+                total = total.adding(delta)
+            }
+        }
+
+        return total
+    }
+
     private func parseDate(_ value: String?) -> Date? {
         guard let value else {
             return nil
@@ -181,6 +412,32 @@ final class UsageReader {
             return Double(value) ?? 0
         }
         return 0
+    }
+
+    private func int64(_ value: Any?) -> Int64 {
+        if let value = value as? Int64 {
+            return value
+        }
+        if let value = value as? Int {
+            return Int64(value)
+        }
+        if let value = value as? Double {
+            return Int64(value)
+        }
+        if let value = value as? String {
+            return Int64(value) ?? 0
+        }
+        return 0
+    }
+
+    private func tokenUsage(_ value: [String: Any]) -> TokenUsage {
+        TokenUsage(
+            inputTokens: int64(value["input_tokens"]),
+            cachedInputTokens: int64(value["cached_input_tokens"]),
+            outputTokens: int64(value["output_tokens"]),
+            reasoningOutputTokens: int64(value["reasoning_output_tokens"]),
+            totalTokens: int64(value["total_tokens"])
+        )
     }
 
     private func stringify(_ value: Any?) -> String? {
@@ -324,6 +581,7 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
     }()
     private var timer: Timer?
     private var lastHistory: UsageSnapshotHistory?
+    private var tokenActivity = TokenActivitySummary.empty(recentWindowSeconds: 180)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -337,6 +595,7 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
 
     private func refresh() {
         lastHistory = reader.latestSnapshotHistory()
+        tokenActivity = reader.tokenActivitySummary(recentWindowSeconds: 180)
         updateStatusTitle()
         rebuildMenu()
     }
@@ -379,6 +638,9 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
             ))
             menu.addItem(NSMenuItem.separator())
             menu.addItem(disabled("Last change: \(formatDelta(history.primaryLeftDelta, label: "5h")), \(formatDelta(history.secondaryLeftDelta, label: "weekly"))"))
+            menu.addItem(disabled("Last turn tokens: \(formatTokenUsage(tokenActivity.latestTurnUsage))"))
+            menu.addItem(disabled("Last 3 min tokens: \(formatTokenUsage(tokenActivity.recentUsage))"))
+            menu.addItem(disabled("Latest call tokens: \(formatTokenUsage(tokenActivity.latestCallUsage))"))
             menu.addItem(disabled("Plan: \(snapshot.planType)"))
             if snapshot.credits != nil {
                 menu.addItem(disabled("Credits data available"))
@@ -456,6 +718,33 @@ final class CodexUsageMeter: NSObject, NSApplicationDelegate {
         }
         return String(format: "%.1f%%", value)
     }
+
+    private func formatTokenUsage(_ usage: TokenUsage?) -> String {
+        guard let usage else {
+            return "unknown"
+        }
+        guard usage.totalTokens > 0 else {
+            return "0 total"
+        }
+
+        return "\(formatTokenCount(usage.totalTokens)) total (out \(formatTokenCount(usage.outputTokens)))"
+    }
+
+    private func formatTokenCount(_ value: Int64) -> String {
+        let absolute = Double(abs(value))
+        let sign = value < 0 ? "-" : ""
+
+        switch absolute {
+        case 1_000_000_000...:
+            return "\(sign)\(String(format: "%.2f", absolute / 1_000_000_000))B"
+        case 1_000_000...:
+            return "\(sign)\(String(format: "%.1f", absolute / 1_000_000))M"
+        case 1_000...:
+            return "\(sign)\(String(format: "%.1f", absolute / 1_000))K"
+        default:
+            return "\(value)"
+        }
+    }
 }
 
 @main
@@ -484,6 +773,7 @@ struct Main {
 
         let snapshot = history.latest
         let stats = reader.localTokenStats()
+        let tokenActivity = reader.tokenActivitySummary(recentWindowSeconds: 180)
         let primaryLeft = max(0, 100 - snapshot.primaryUsedPercent)
         let weeklyLeft = max(0, 100 - snapshot.secondaryUsedPercent)
         let resetFormatter = DateFormatter()
@@ -496,8 +786,11 @@ struct Main {
         let todayTokens = stats.today.map(formatTokenCountForConsole) ?? "unknown"
         let primaryDelta = formatDeltaForConsole(history.primaryLeftDelta, label: "5h")
         let weeklyDelta = formatDeltaForConsole(history.secondaryLeftDelta, label: "weekly")
+        let latestTurn = formatUsageForConsole(tokenActivity.latestTurnUsage)
+        let recent = formatUsageForConsole(tokenActivity.recentUsage)
+        let latestCall = formatUsageForConsole(tokenActivity.latestCallUsage)
 
-        print("Cdx \(Int(primaryLeft.rounded()))% left | weekly \(Int(weeklyLeft.rounded()))% left | last change \(primaryDelta), \(weeklyDelta) | 5h reset \(primaryReset) | weekly reset \(weeklyReset) | local today \(todayTokens)")
+        print("Cdx \(Int(primaryLeft.rounded()))% left | weekly \(Int(weeklyLeft.rounded()))% left | last change \(primaryDelta), \(weeklyDelta) | last turn \(latestTurn) | 3m \(recent) | latest call \(latestCall) | 5h reset \(primaryReset) | weekly reset \(weeklyReset) | local today \(todayTokens)")
     }
 
     private static func formatDeltaForConsole(_ delta: Double?, label: String) -> String {
@@ -511,6 +804,17 @@ struct Main {
         let sign = delta > 0 ? "+" : ""
         let value = delta.rounded() == delta ? "\(Int(delta))%" : String(format: "%.1f%%", delta)
         return "\(label) \(sign)\(value) left"
+    }
+
+    private static func formatUsageForConsole(_ usage: TokenUsage?) -> String {
+        guard let usage else {
+            return "unknown"
+        }
+        guard usage.totalTokens > 0 else {
+            return "0 total"
+        }
+
+        return "\(formatTokenCountForConsole(usage.totalTokens)) total (in \(formatTokenCountForConsole(usage.inputTokens)), out \(formatTokenCountForConsole(usage.outputTokens)))"
     }
 
     private static func formatTokenCountForConsole(_ value: Int64) -> String {
