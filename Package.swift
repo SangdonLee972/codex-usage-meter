@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
     name: "CodexUsageMeter",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "codex-usage-meter", targets: ["CodexUsageMeter"])
@@ -13,7 +13,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "CodexUsageMeter",
-            path: "Sources/CodexUsageMeter"
+            path: "Sources/CodexUsageMeter",
+            resources: [.process("Resources")]
         )
     ]
 )

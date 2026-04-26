@@ -14,6 +14,7 @@ swift build -c release
 
 mkdir -p "$BIN_DIR" "$LOG_DIR" "$PLIST_DIR"
 install -m 755 "$ROOT_DIR/.build/release/codex-usage-meter" "$BIN_PATH"
+printf '%s\n' "$ROOT_DIR" > "$LOG_DIR/source-path"
 
 cat > "$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -40,6 +41,8 @@ PLIST
 launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
+
+rm -f "$LOG_DIR/update-in-progress"
 
 echo "Codex Usage Meter is running."
 echo "Menu bar binary: $BIN_PATH"
